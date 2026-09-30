@@ -1,0 +1,151 @@
+name: Build iPhone IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+          pod --version
+
+      - name: Check app files
+        run: |
+          set -euo pipefail
+          if [[ ! -f www/index.html || ! -f www/app.js || ! -f www/styles.css ]]; then
+            echo '::error::Upload the CONTENTS of PHANTOMDDD-main to the repository root. The www folder must be beside .github, not inside another folder.'
+            exit 1
+          fi
+
+      - name: Install dependencies and build web app
+        run: |
+          set -euo pipefail
+          if [[ -f package.json ]]; then
+            if [[ -f package-lock.json ]]; then
+              npm ci --no-audit --no-fund
+            else
+              npm install --no-audit --no-fund
+            fi
+            npm run build --if-present
+          else
+            npm init -y
+          fi
+          npm install --save-exact --no-audit --no-fund \
+            @capacitor/core@6 @capacitor/cli@6 @capacitor/ios@6 \
+            @capacitor/haptics@6 @capacitor/local-notifications@6
+
+      - name: Create iOS project
+        run: |
+          set -euo pipefail
+          cat > capacitor.config.json <<'JSON'
+          {
+            "appId": "com.demo.phantom122",
+            "appName": "Phantom Demo",
+            "webDir": "www",
+            "server": { "iosScheme": "app" },
+            "ios": { "contentInset": "never" }
+          }
+          JSON
+          if [[ ! -d ios ]]; then
+            npx cap add ios
+          fi
+          npx cap sync ios
+
+      - name: Configure iPhone permissions and app icon
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import plistlib
+          import shutil
+          from pathlib import Path
+
+          plist = Path('ios/App/App/Info.plist')
+          with plist.open('rb') as file:
+              settings = plistlib.load(file)
+          settings['UISupportedInterfaceOrientations'] = ['UIInterfaceOrientationPortrait']
+          settings['UISupportedInterfaceOrientations~ipad'] = ['UIInterfaceOrientationPortrait']
+          settings['NSCameraUsageDescription'] = 'Take a photo for your profile picture.'
+          settings['NSPhotoLibraryUsageDescription'] = 'Choose a photo for your profile picture.'
+          with plist.open('wb') as file:
+              plistlib.dump(settings, file)
+
+          icon = Path('www/icon-1024.png')
+          if icon.is_file():
+              catalog = Path('ios/App/App/Assets.xcassets/AppIcon.appiconset')
+              catalog.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(icon, catalog / 'AppIcon.png')
+              (catalog / 'Contents.json').write_text(json.dumps({
+                  'images': [{'filename': 'AppIcon.png', 'idiom': 'universal', 'platform': 'ios', 'size': '1024x1024'}],
+                  'info': {'author': 'xcode', 'version': 1}
+              }, indent=2))
+          PY
+
+      - name: Build unsigned iPhone app
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -workspace ios/App/App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/phantom-ios-build" \
+            CODE_SIGN_IDENTITY='' \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            build 2>&1 | tee "$RUNNER_TEMP/phantom-ios-build.log"
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          APP_PATH="$RUNNER_TEMP/phantom-ios-build/Build/Products/Release-iphoneos/App.app"
+          test -d "$APP_PATH"
+          mkdir -p "$RUNNER_TEMP/phantom-ipa/Payload" dist
+          ditto "$APP_PATH" "$RUNNER_TEMP/phantom-ipa/Payload/App.app"
+          (
+            cd "$RUNNER_TEMP/phantom-ipa"
+            zip -qry "$GITHUB_WORKSPACE/dist/Phantom-Demo.ipa" Payload
+          )
+          unzip -t dist/Phantom-Demo.ipa
+
+      - name: Upload IPA for download
+        uses: actions/upload-artifact@v7
+        with:
+          name: Phantom-Demo-IPA
+          path: dist/Phantom-Demo.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log if the build fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: iOS-build-log
+          path: ${{ runner.temp }}/phantom-ios-build.log
+          if-no-files-found: ignore
